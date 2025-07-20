@@ -22,25 +22,23 @@
 #define LED0_NODE DT_ALIAS(led3)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
-/* GPS related defines */
-#define UART_DEVICE_NODE DT_NODELABEL(uart1)
-#define MSG_SIZE 128
-
-/* GPS message queue and UART device */
-K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 4, 4);
-static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
-static char rx_buf[MSG_SIZE];
-static int rx_buf_pos = 0;
-
 /* GSM PPP defines */
 #define GSM_MODEM_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(zephyr_gsm_ppp)
 #define UART_NODE DT_BUS(GSM_MODEM_NODE)
 
 static const struct device *const gsm_dev = DEVICE_DT_GET(GSM_MODEM_NODE);
+static const struct device *const uart_dev = DEVICE_DT_GET(UART_NODE);
 static struct net_mgmt_event_callback mgmt_cb;
 
-/* GPS UART callback function */
-void serial_cb(const struct device *dev, void *user_data)
+/* GPS related variables */
+#define MSG_SIZE 128
+static char rx_buf[MSG_SIZE];
+static int rx_buf_pos = 0;
+static bool gps_response_ready = false;
+static char gps_response_buffer[MSG_SIZE];
+
+/* GPS UART callback function for GSM UART */
+void gps_serial_cb(const struct device *dev, void *user_data)
 {
     uint8_t c;
 
@@ -54,7 +52,12 @@ void serial_cb(const struct device *dev, void *user_data)
         if (c == '\r' || c == '\n') {
             if (rx_buf_pos > 0) {
                 rx_buf[rx_buf_pos] = '\0';
-                k_msgq_put(&uart_msgq, rx_buf, K_NO_WAIT);
+                
+                // Check if this is a GPS response
+                if (strstr(rx_buf, "+QGPSLOC:") || strstr(rx_buf, "OK") || strstr(rx_buf, "ERROR")) {
+                    strcpy(gps_response_buffer, rx_buf);
+                    gps_response_ready = true;
+                }
                 rx_buf_pos = 0;
             }
         } else {
@@ -65,38 +68,43 @@ void serial_cb(const struct device *dev, void *user_data)
     }
 }
 
-/* Send data via UART */
-void uart_send(const char *data)
+/* Send data via GSM UART */
+void gps_uart_send(const char *data)
 {
     for (size_t i = 0; i < strlen(data); i++) {
         uart_poll_out(uart_dev, data[i]);
     }
 }
 
-/* Send AT command and check response */
-bool send_at_and_check(const char *cmd, char *response_out)
+/* Send AT command and wait for response */
+bool gps_send_at_and_check(const char *cmd, char *response_out)
 {
-    char resp_buf[MSG_SIZE] = {0};
+    printk("GPS Command: %s", cmd);
+    gps_response_ready = false;
+    gps_uart_send(cmd);
 
-    printk("Sending: %s", cmd);
-    uart_send(cmd);
-
-    while (1) {
-        if (k_msgq_get(&uart_msgq, &resp_buf, K_SECONDS(5)) == 0) {
-            printk("\nResponse: %s\n", resp_buf);
-            if (strstr(resp_buf, "+CME ERROR: 516")) {
-                return false;
-            } else if (strstr(resp_buf, "+QGPSLOC:")) {
+    // Wait for response with timeout
+    for (int i = 0; i < 50; i++) {  // 5 second timeout
+        k_msleep(100);
+        if (gps_response_ready) {
+            printk("GPS Response: %s\n", gps_response_buffer);
+            
+            if (strstr(gps_response_buffer, "+QGPSLOC:")) {
                 if (response_out) {
-                    strcpy(response_out, resp_buf);
+                    strcpy(response_out, gps_response_buffer);
                 }
                 return true;
+            } else if (strstr(gps_response_buffer, "OK")) {
+                return true;
+            } else if (strstr(gps_response_buffer, "ERROR")) {
+                return false;
             }
-        } else {
-            printk("No response or timeout.\n");
-            return false;
+            gps_response_ready = false;
         }
     }
+    
+    printk("GPS Command timeout\n");
+    return false;
 }
 
 /* Extract latitude and longitude from GPS response */
@@ -128,51 +136,67 @@ void extract_lat_lon(const char *gps_response, char *latitude, char *longitude)
     longitude[comma - start] = '\0';
 }
 
-/* GPS initialization and data fetching */
+/* GPS initialization and data fetching using GSM UART */
 bool init_and_fetch_gps(char *latitude, char *longitude)
 {
-    printk("EC200U GPS Initialization Start\n");
+    printk("=== GPS INITIALIZATION START ===\n");
 
     if (!device_is_ready(uart_dev)) {
         printk("UART device not ready for GPS!\n");
         return false;
     }
 
-    uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
+    // Set up UART callback for GPS communication
+    uart_irq_callback_user_data_set(uart_dev, gps_serial_cb, NULL);
     uart_irq_rx_enable(uart_dev);
 
-    k_sleep(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
 
     // Initialize GPS
-    send_at_and_check("AT\r\n", NULL);
-    send_at_and_check("AT+QGPS=1\r\n", NULL);
+    if (!gps_send_at_and_check("AT\r\n", NULL)) {
+        printk("GPS AT command failed\n");
+        return false;
+    }
+
+    k_sleep(K_SECONDS(1));
+
+    if (!gps_send_at_and_check("AT+QGPS=1\r\n", NULL)) {
+        printk("GPS start command failed\n");
+        return false;
+    }
+
+    printk("GPS started, waiting for fix...\n");
+    k_sleep(K_SECONDS(2));
 
     char gps_response[MSG_SIZE] = {0};
     int attempts = 0;
     bool got_fix = false;
 
-    printk("Waiting for GPS fix...\n");
-    while (attempts < 12) {  // Retry up to 60 seconds
-        k_sleep(K_SECONDS(5));
-        if (send_at_and_check("AT+QGPSLOC?\r\n", gps_response)) {
+    while (attempts < 10) {  // Try for 50 seconds
+        if (gps_send_at_and_check("AT+QGPSLOC?\r\n", gps_response)) {
             extract_lat_lon(gps_response, latitude, longitude);
-            printk("GPS Fix Acquired - Latitude: %s, Longitude: %s\n", latitude, longitude);
-            got_fix = true;
-            break;
+            if (strcmp(latitude, "N/A") != 0 && strcmp(longitude, "N/A") != 0) {
+                printk("*** GPS FIX ACQUIRED ***\n");
+                printk("Latitude: %s\n", latitude);
+                printk("Longitude: %s\n", longitude);
+                got_fix = true;
+                break;
+            }
         }
         attempts++;
-        printk("GPS attempt %d/12...\n", attempts);
+        printk("GPS attempt %d/10...\n", attempts);
+        k_sleep(K_SECONDS(5));
     }
 
     if (!got_fix) {
-        printk("No GPS fix after waiting 60 seconds.\n");
+        printk("No GPS fix after 50 seconds\n");
         strcpy(latitude, "N/A");
         strcpy(longitude, "N/A");
     }
 
     // Stop GPS to save power
-    send_at_and_check("AT+QGPSEND\r\n", NULL);
-    printk("GPS fetch complete\n");
+    gps_send_at_and_check("AT+QGPSEND\r\n", NULL);
+    printk("=== GPS FETCH COMPLETE ===\n");
     
     return got_fix;
 }
@@ -231,32 +255,32 @@ void init_gsm(void)
 {
     printk("Init... gsm\n");
 
-	const struct device *uart_dev_gsm = DEVICE_DT_GET(UART_NODE);
-
 	/* Optional register modem power callbacks */
 	gsm_ppp_register_modem_power_callback(gsm_dev, modem_on_cb, modem_off_cb, NULL);
 
 	printk("Board '%s' APN '%s' UART '%s' device %p (%s)",
 		CONFIG_BOARD, CONFIG_MODEM_GSM_APN,
-		uart_dev_gsm->name, uart_dev_gsm, gsm_dev->name);
+		uart_dev->name, uart_dev, gsm_dev->name);
 
+    printk("GSM Hardware Initialized\n");
+    
+    // *** GPS INTEGRATION POINT ***
+    // Fetch GPS data BEFORE setting up network callbacks
+    printk("Starting GPS fetch before network initialization...\n");
+    char latitude[20], longitude[20];
+    bool gps_success = init_and_fetch_gps(latitude, longitude);
+    
+    if (gps_success) {
+        printk("*** GPS SUCCESS: Lat=%s, Lon=%s ***\n", latitude, longitude);
+    } else {
+        printk("GPS fetch failed, continuing without GPS data\n");
+    }
+    
+    // Now set up network event callbacks
 	net_mgmt_init_event_callback(&mgmt_cb, event_handler,
 				     NET_EVENT_L4_CONNECTED |
 				     NET_EVENT_L4_DISCONNECTED);
 	net_mgmt_add_event_callback(&mgmt_cb);
 
-    printk("GSM Initialized\n");
-    
-    // GPS integration point - fetch GPS data after GSM initialization
-    char latitude[20], longitude[20];
-    bool gps_success = init_and_fetch_gps(latitude, longitude);
-    
-    if (gps_success) {
-        printk("GPS data successfully fetched: Lat=%s, Lon=%s\n", latitude, longitude);
-        // You can store these coordinates for later use in AWS or other functions
-    } else {
-        printk("GPS fetch failed, continuing without GPS data\n");
-    }
-    
-    printk("Proceeding with network operations...\n");
+    printk("Network callbacks initialized, GSM init complete\n");
 }
