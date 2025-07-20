@@ -81,29 +81,48 @@ bool gps_send_at_and_check(const char *cmd, char *response_out)
 {
     printk("GPS Command: %s", cmd);
     gps_response_ready = false;
+    
+    // Clear any pending responses first
+    k_msleep(100);
+    gps_response_ready = false;
+    
     gps_uart_send(cmd);
 
-    // Wait for response with timeout
-    for (int i = 0; i < 50; i++) {  // 5 second timeout
+    // Wait for response with longer timeout for GPS commands
+    int timeout_loops = (strstr(cmd, "QGPSLOC") != NULL) ? 100 : 50;  // 10s for GPS, 5s for others
+    
+    for (int i = 0; i < timeout_loops; i++) {
         k_msleep(100);
         if (gps_response_ready) {
             printk("GPS Response: %s\n", gps_response_buffer);
             
-            if (strstr(gps_response_buffer, "+QGPSLOC:")) {
+            // For GPS location command, specifically look for +QGPSLOC response
+            if (strstr(cmd, "QGPSLOC") && strstr(gps_response_buffer, "+QGPSLOC:")) {
                 if (response_out) {
                     strcpy(response_out, gps_response_buffer);
                 }
                 return true;
-            } else if (strstr(gps_response_buffer, "OK")) {
-                return true;
-            } else if (strstr(gps_response_buffer, "ERROR")) {
+            }
+            // For GPS location command, check for specific errors
+            else if (strstr(cmd, "QGPSLOC") && strstr(gps_response_buffer, "+CME ERROR: 516")) {
+                printk("GPS not fixed yet (normal)\n");
                 return false;
             }
+            // For other commands, accept OK
+            else if (strstr(gps_response_buffer, "OK")) {
+                return true;
+            } 
+            // For any command, check for general errors
+            else if (strstr(gps_response_buffer, "ERROR")) {
+                return false;
+            }
+            
+            // Reset and continue waiting for the right response
             gps_response_ready = false;
         }
     }
     
-    printk("GPS Command timeout\n");
+    printk("GPS Command timeout after %d attempts\n", timeout_loops);
     return false;
 }
 
@@ -264,9 +283,13 @@ void init_gsm(void)
 
     printk("GSM Hardware Initialized\n");
     
+    // Wait for GSM modem to fully initialize and settle
+    printk("Waiting for GSM modem to stabilize completely...\n");
+    k_sleep(K_SECONDS(15));  // Wait for GSM to fully settle
+    
     // *** GPS INTEGRATION POINT ***
-    // Fetch GPS data BEFORE setting up network callbacks
-    printk("Starting GPS fetch before network initialization...\n");
+    // Fetch GPS data AFTER GSM has stabilized
+    printk("GSM stabilized, starting GPS fetch...\n");
     char latitude[20], longitude[20];
     bool gps_success = init_and_fetch_gps(latitude, longitude);
     
