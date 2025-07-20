@@ -285,7 +285,7 @@ void init_gsm(void)
     
     // Wait for GSM modem to fully initialize and settle
     printk("Waiting for GSM modem to stabilize completely...\n");
-    k_sleep(K_SECONDS(15));  // Wait for GSM to fully settle
+    k_sleep(K_SECONDS(30));  // Wait for GSM to fully settle (longer delay)
     
     // *** GPS INTEGRATION POINT ***
     // Fetch GPS data AFTER GSM has stabilized
